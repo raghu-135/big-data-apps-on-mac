@@ -5,6 +5,8 @@
 include ../Makefile.common
 
 init:
+	@$(MAKE) network
+	@$(MAKE) build-base
 	@ids="$$(docker compose config | grep ZOO_SERVER_ID | awk -F: '{gsub(/[" ]/, "", $$2); print $$2}')"; \
 	echo "creating myId files for zookeeper instances :\n$$ids"; \
 	for id in $$ids; do \

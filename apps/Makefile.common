@@ -113,6 +113,7 @@ up-without-jinja2: ## Start all services without rendering
 
 up-minimal: ## Start services for this project only
 	@echo "$(GREEN)\nStarting services for $(SERVICE_NAME)...$(NC)"
+	@$(MAKE) init
 	@$(MAKE) render
 	@$(MAKE) up-minimal-without-jinja2
 
