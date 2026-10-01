@@ -83,7 +83,7 @@ build-base: ## Build the base Docker image (use NO_CACHE=1 for no cache)
 	@echo "$(GREEN)Base image build complete!$(NC)"
 
 build-base-no-cache: ## Build the base Docker image without cache
-    @$(MAKE) build-base NO_CACHE=1
+	@$(MAKE) build-base NO_CACHE=1
 
 build-no-cache: ## Build Docker images without using cache
 	@echo "$(GREEN)Building Docker images without cache for $(SERVICE_NAME)...$(NC)"

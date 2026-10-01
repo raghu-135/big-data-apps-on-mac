@@ -8,7 +8,6 @@ This project provides a streamlined way to set up and manage a big data environm
 
 ### Features
 
-- **Docker Service Manager (webui)**: Bring services up/down from a browser instead of the terminal.
 - **Makefile & Docker Compose Integration**: Easily manage services using standardized Makefile commands.
 - **Automatic Dependency Management**: Dependencies are started automatically as needed.
 - **Health Checks**: Verify that services are healthy with a single command.
@@ -29,25 +28,10 @@ git clone https://github.com/your-repo/big-data-mac-arm64-setup.git
 cd big-data-mac-arm64-setup
 ```
 
-## Quick Start: Docker Service Manager (webui)
 
-The easiest way to run this project is through the bundled web UI - bring it up once, then start or stop every other service from the browser instead of remembering `make up`/`make down` per directory.
 
-```sh
-cd apps/webui
-make up
-```
-Open http://localhost:8501. Each service listed there has **Bring up** / **Stop** buttons; clicking them runs `make up`/`make down` for that service in the background, including its dependencies, exactly as if you'd run it from the terminal yourself.
 
-`webui` itself (and the `docker-socket-proxy` it depends on) can only be managed from the terminal - it's infrastructure for the UI, not a workload you manage through it:
-```sh
-cd apps/webui
-make down
-```
-
-> Prefer the terminal for everything? The webui is optional - every service below can still be managed directly with the Makefile commands, with or without the webui running.
-
-## Running the Services from the Terminal
+## Running the Services (Makefile-based)
 
 Each service is managed from its own directory under `apps/` using Makefile commands. The Makefile system will automatically start dependencies, run health checks, and manage containers.
 
@@ -180,7 +164,6 @@ By following these instructions, you can set up and manage a big data environmen
 
 | Service         | Directory         | Start Command           | UI/Port Example         | Depends On         |
 |-----------------|------------------|-------------------------|------------------------|--------------------|
-| webui           | webui            | `make up`               | 8501                    | -                  |
 | Zookeeper       | zookeeper        | `make up`               | 8081/8082/8083         | -                  |
 | Kafka           | kafka            | `make up`               | 9092                   | Zookeeper          |
 | AKHQ            | akhq             | `make up`               | 9093                   | Kafka              |
