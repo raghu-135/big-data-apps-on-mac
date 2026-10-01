@@ -1,110 +1,200 @@
 import streamlit as st
 import docker
 import os
-import subprocess
+import re
+from collections import defaultdict
 from pathlib import Path
 
 st.set_page_config(page_title="Docker Service Manager", layout="wide")
 
 client = docker.from_env()
 
+# Mounted read-only via `-v ../:/apps` in the webui Makefile; each subfolder is a service project.
+APPS_DIR = Path(os.environ.get("APPS_DIR", "/apps"))
+EXCLUDED_DIRS = {"scripts", "jinja2"}
+
+MAX_OPEN_LOG_PANELS = 4   # caps concurrently rendered log panels so the UI stays responsive
+LOG_TAIL = 200
+MAX_LOG_CHARS = 20000     # hard cap on rendered log text regardless of tail, keeps the DOM light
+
+@st.cache_data(ttl=30)
+def get_app_service_names():
+    if not APPS_DIR.is_dir():
+        return set()
+    return {
+        p.name for p in APPS_DIR.iterdir()
+        if p.is_dir() and not p.name.startswith(".") and p.name not in EXCLUDED_DIRS
+    }
+
+def is_app_container(name, project, service_names):
+    if project in service_names:
+        return True
+    # Containers started outside Compose (e.g. webui itself) are matched by name.
+    return name in service_names
+
+@st.cache_data(ttl=3)
 def get_containers():
+    service_names = get_app_service_names()
     containers = []
     for c in client.containers.list(all=True):
+        project = c.labels.get('com.docker.compose.project')
+        if service_names and not is_app_container(c.name, project, service_names):
+            continue
         containers.append({
             'id': c.id,
             'name': c.name,
             'image': c.image.tags[0] if c.image.tags else str(c.image),
-            'status': c.status
         })
     return containers
 
-def get_container_logs(cid, tail=100):
-    container = client.containers.get(cid)
+def _truncate(text):
+    if len(text) > MAX_LOG_CHARS:
+        return f"...[truncated, showing last {MAX_LOG_CHARS} chars]...\n" + text[-MAX_LOG_CHARS:]
+    return text
+
+@st.cache_data(ttl=4)
+def _fetch_raw_logs(cid, tail, timestamps):
+    return client.containers.get(cid).logs(tail=tail, timestamps=timestamps).decode('utf-8', errors='replace')
+
+def get_container_logs(cid, tail=LOG_TAIL):
     try:
-        logs = container.logs(tail=tail).decode('utf-8')
+        logs = _fetch_raw_logs(cid, tail, False)
     except Exception as e:
-        logs = f"Error fetching logs: {e}"
-    return logs
+        return f"Error fetching logs: {e}"
+    return _truncate(logs)
 
-def start_container(cid):
-    container = client.containers.get(cid)
-    container.start()
+def get_merged_group_logs(group_containers, tail=LOG_TAIL):
+    # Docker has no multi-container log API; fetch each with timestamps and interleave, like `docker compose logs`.
+    entries = []
+    for c in group_containers:
+        try:
+            raw = _fetch_raw_logs(c['id'], tail, True)
+        except Exception as e:
+            entries.append(("", f"[{c['name']}] Error fetching logs: {e}"))
+            continue
+        for line in raw.splitlines():
+            if not line:
+                continue
+            ts, _, rest = line.partition(' ')
+            entries.append((ts, f"[{c['name']}] {rest}"))
+    # RFC3339Nano timestamps are fixed-width UTC strings, so lexicographic sort == chronological sort.
+    entries.sort(key=lambda e: e[0])
+    return _truncate("\n".join(text for _, text in entries))
 
-def stop_container(cid):
-    container = client.containers.get(cid)
-    container.stop()
+def _open_panel_order():
+    return st.session_state.setdefault('_open_log_panels', [])
 
-def restart_container(cid):
-    container = client.containers.get(cid)
-    container.restart()
+def _toggle_panel(state_key):
+    """Flip a log panel's visibility, evicting the oldest-opened panel past MAX_OPEN_LOG_PANELS.
+    Returns True if another panel was force-closed (needs a full rerun to reflect everywhere)."""
+    is_open = not st.session_state.get(state_key, False)
+    st.session_state[state_key] = is_open
+    order = _open_panel_order()
+    if state_key in order:
+        order.remove(state_key)
+    if not is_open:
+        return False
+    order.append(state_key)
+    evicted = False
+    while len(order) > MAX_OPEN_LOG_PANELS:
+        oldest = order.pop(0)
+        st.session_state[oldest] = False
+        evicted = True
+    return evicted
 
 
 def main():
     st.title('Docker Service Manager')
     st.markdown('Manage your Docker containers visually')
+    st.caption(f"Up to {MAX_OPEN_LOG_PANELS} log panels can be open at once; opening another closes the oldest.")
 
     st.header('Docker Containers')
+    if not get_app_service_names():
+        st.warning(f"Could not read service folders from {APPS_DIR}; showing all host containers.")
     containers = get_containers()
 
     if not containers:
         st.info('No containers found.')
-    else:
-        # Group containers by the first part of their image (before colon or dash)
-        from collections import defaultdict
-        import re
-        groups = defaultdict(list)
-        for c in containers:
-            # Extract group from image: before first colon or dash
-            image = c['image']
-            m = re.match(r"([\w\-/]+?)[-:].*", image)
-            group = m.group(1) if m else image
-            groups[group].append(c)
+        return
 
-        for group_name in sorted(groups.keys()):
-            with st.expander(f"{group_name} ({len(groups[group_name])})", expanded=True):
-                for c in groups[group_name]:
-                    col1, col2 = st.columns([3, 1])
-                    with col1:
-                        st.subheader(f"{c['name']}")
-                        st.write(f"Image: {c['image']}")
-                        status_color = {'running': 'green', 'exited': 'red', 'paused': 'orange'}.get(c['status'], 'grey')
-                        st.markdown(f"<span style='color:{status_color};font-weight:bold;'>Status: {c['status'].capitalize()}</span>", unsafe_allow_html=True)
-                    with col2:
-                        if c['status'] == 'running':
-                            if st.button(f"Stop {c['name']}"):
-                                stop_container(c['id'])
-                                st.experimental_rerun()
-                            if st.button(f"Restart {c['name']}"):
-                                restart_container(c['id'])
-                                st.experimental_rerun()
-                        else:
-                            if st.button(f"Start {c['name']}"):
-                                start_container(c['id'])
-                                st.experimental_rerun()
+    # Group containers by the first part of their image (before colon or dash)
+    groups = defaultdict(list)
+    for c in containers:
+        m = re.match(r"([\w\-/]+?)[-:].*", c['image'])
+        group = m.group(1) if m else c['image']
+        groups[group].append(c)
 
-                    # Show logs button and display
-                    log_state_key = f"show_logs_{c['id']}"
-                    log_btn_key = f"btn_show_logs_{c['id']}"
-                    if log_state_key not in st.session_state:
-                        st.session_state[log_state_key] = False
+    for group_name in sorted(groups.keys()):
+        group_containers = groups[group_name]
+        with st.expander(f"{group_name} ({len(group_containers)})", expanded=True):
+            if len(group_containers) > 1:
+                render_group_logs_panel(group_name, group_containers)
+            for c in group_containers:
+                render_container_row(c['id'], c['name'], c['image'])
 
-                    if st.button(
-                        f"{'Hide' if st.session_state[log_state_key] else 'Show'} Logs for {c['name']}", key=log_btn_key
-                    ):
-                        st.session_state[log_state_key] = not st.session_state[log_state_key]
 
-                    if st.session_state[log_state_key]:
-                        logs = get_container_logs(c['id'], tail=200)
-                        st.text_area(
-                            f"Logs: {c['name']}",
-                            logs,
-                            height=400,
-                            key=f"logs_area_{c['id']}",
-                            args=None,
-                            disabled=True
-                        )
-                        st.markdown("<style>textarea { resize: vertical; width: 100% !important; }</style>", unsafe_allow_html=True)
+@st.fragment
+def render_group_logs_panel(group_name, group_containers):
+    # Fragment-scoped: toggling combined logs only reruns this panel, not the whole page.
+    state_key = f"show_group_logs_{group_name}"
+    is_open = st.session_state.get(state_key, False)
+    label = f"{'Hide' if is_open else 'Show'} Combined Logs for {group_name} ({len(group_containers)} containers)"
+    if st.button(label, key=f"btn_{state_key}"):
+        evicted = _toggle_panel(state_key)
+        st.rerun(scope="app" if evicted else "fragment")
+
+    if st.session_state.get(state_key, False):
+        st.text_area(
+            f"Combined Logs: {group_name}",
+            get_merged_group_logs(group_containers),
+            height=500,
+            key=f"group_logs_area_{group_name}",
+            disabled=True
+        )
+    st.divider()
+
+
+@st.fragment
+def render_container_row(cid, name, image):
+    # Fragment-scoped: start/stop/restart/logs here never re-lists all containers or other panels.
+    try:
+        status = client.containers.get(cid).status
+    except Exception:
+        status = "unknown"
+
+    col1, col2 = st.columns([3, 1])
+    with col1:
+        st.subheader(name)
+        st.write(f"Image: {image}")
+        status_color = {'running': 'green', 'exited': 'red', 'paused': 'orange'}.get(status, 'grey')
+        st.markdown(f"<span style='color:{status_color};font-weight:bold;'>Status: {status.capitalize()}</span>", unsafe_allow_html=True)
+    with col2:
+        if status == 'running':
+            if st.button(f"Stop {name}", key=f"stop_{cid}"):
+                client.containers.get(cid).stop()
+                st.rerun(scope="fragment")
+            if st.button(f"Restart {name}", key=f"restart_{cid}"):
+                client.containers.get(cid).restart()
+                st.rerun(scope="fragment")
+        else:
+            if st.button(f"Start {name}", key=f"start_{cid}"):
+                client.containers.get(cid).start()
+                st.rerun(scope="fragment")
+
+    log_state_key = f"show_logs_{cid}"
+    is_open = st.session_state.get(log_state_key, False)
+    if st.button(f"{'Hide' if is_open else 'Show'} Logs for {name}", key=f"btn_show_logs_{cid}"):
+        evicted = _toggle_panel(log_state_key)
+        st.rerun(scope="app" if evicted else "fragment")
+
+    if st.session_state.get(log_state_key, False):
+        st.text_area(
+            f"Logs: {name}",
+            get_container_logs(cid),
+            height=400,
+            key=f"logs_area_{cid}",
+            disabled=True
+        )
 
 if __name__ == "__main__":
     main()
